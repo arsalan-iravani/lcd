@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <EEPROM.h>
 #include "config.h"
 
 TFT_eSPI tft = TFT_eSPI();
@@ -39,6 +40,21 @@ WebServer server(HTTP_PORT);
 #define BLACK       TFT_BLACK
 #define WHITE       TFT_WHITE
 
+// =====================================================
+// WiFi config stored in EEPROM
+// =====================================================
+#define WIFI_SSID_MAX 32
+#define WIFI_PASS_MAX 64
+
+struct WiFiConfig {
+  uint8_t version; // SETTINGS_VERSION
+  char ssid[WIFI_SSID_MAX];
+  char pass[WIFI_PASS_MAX];
+};
+
+// EEPROM address for WiFiConfig: use SETTINGS_ADDR
+// =====================================================
+
 // Runtime state
 int pupilX = CX;
 int pupilY = CY;
@@ -47,33 +63,26 @@ uint16_t irisColor = IRIS_BROWN;
 int emotion = EMO_NORMAL;
 int blinkStyle = BLINK_NORMAL;
 
-// Timing
 unsigned long lastBlink = 0;
 
+WiFiConfig wifiCfg;
+
+// Forward
+void startAPPortal();
+void startHTTPServer();
+
 // =====================================================
-// Drawing helpers (same logic as previous fixed example)
+// Drawing helpers
 // =====================================================
 
 void drawBaseEye()
 {
     tft.fillScreen(BG);
-
-    // دایره بیرونی
     tft.fillCircle(CX, CY, EYE_RADIUS, RED_1);
-
-    // عنبیه بزرگ
     tft.fillCircle(CX, CY, IRIS_RADIUS, RED_2);
-
-    // لایه دوم
     tft.fillCircle(CX, CY, 96, RED_3);
-
-    // لایه سوم
     tft.fillCircle(CX, CY, 84, RED_4);
-
-    // مرکز روشن
     tft.fillCircle(CX, CY, 70, RED_5);
-
-    // حلقه‌ها
     tft.drawCircle(CX, CY, 103, DARK_RED);
     tft.drawCircle(CX, CY, 106, RED_3);
     tft.drawCircle(CX, CY, 108, DARK_RED);
@@ -90,7 +99,6 @@ void redrawIrisUnderPupil(int x, int y)
     tft.drawCircle(CX, CY, 106, RED_3);
     tft.drawCircle(CX, CY, 108, DARK_RED);
     tft.fillCircle(x, y, r, RED_4);
-    // catchlights relative to pupil
     tft.fillCircle(x - 10, y - 10, 6, WHITE);
     tft.fillCircle(x + 9, y + 10, 2, WHITE);
 }
@@ -107,7 +115,6 @@ void drawPupil(int x, int y)
     tft.fillCircle(x - 10, y - 10, max(2, pupilRadius / 4), WHITE);
 }
 
-// Constrain a gaze point inside the iris
 void constrainInsideIris(int &tx, int &ty)
 {
     float dx = tx - CX;
@@ -144,7 +151,6 @@ void blinkOnce(int speed_ms = BLINK_SPEED_NORMAL)
     int steps = max(3, speed_ms / 25);
     for (int i = 0; i <= steps; i++) {
         int h = (EYE_RADIUS * i) / steps;
-        // draw covers
         drawBaseEye();
         tft.fillRect(0, 0, TFT_WIDTH, CY - (EYE_RADIUS - h), COLOR_BLACK);
         tft.fillRect(0, CY + (EYE_RADIUS - h), TFT_WIDTH, TFT_HEIGHT - (CY + (EYE_RADIUS - h)), COLOR_BLACK);
@@ -162,12 +168,90 @@ void blinkOnce(int speed_ms = BLINK_SPEED_NORMAL)
 }
 
 // =====================================================
-// Web / Serial control
+// EEPROM helpers
 // =====================================================
 
-void sendCORS() {
-    server.sendHeader("Access-Control-Allow-Origin", "*");
+void loadWiFiConfig() {
+    EEPROM.begin(EEPROM_SIZE);
+    EEPROM.get(SETTINGS_ADDR, wifiCfg);
+    if (wifiCfg.version != SETTINGS_VERSION) {
+        wifiCfg.version = 0;
+        wifiCfg.ssid[0] = '\0';
+        wifiCfg.pass[0] = '\0';
+    }
 }
+
+void saveWiFiConfig() {
+    wifiCfg.version = SETTINGS_VERSION;
+    EEPROM.put(SETTINGS_ADDR, wifiCfg);
+    EEPROM.commit();
+}
+
+// =====================================================
+// WiFi helpers + AP portal
+// =====================================================
+
+bool tryConnectWiFi(const char* ssid, const char* pass, unsigned long timeout_ms = WIFI_TIMEOUT) {
+    if (strlen(ssid) == 0) return false;
+    Serial.printf("Trying WiFi: %s\n", ssid);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, pass);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeout_ms) {
+        delay(200);
+        Serial.print('.');
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("Connected, IP: %s\n", WiFi.localIP().toString().c_str());
+        return true;
+    }
+    Serial.println("WiFi connect failed");
+    return false;
+}
+
+void handlePortalRoot() {
+    String html = "<html><head><meta name=viewport content='width=device-width,initial-scale=1'></head><body>";
+    html += "<h3>Configure WiFi</h3>";
+    html += "<form action=\"/save\" method=\"POST\">";
+    html += "SSID: <input name=ssid maxlength=32><br>Password: <input name=pass maxlength=64><br>";
+    html += "<input type=submit value=Save></form>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handlePortalSave() {
+    if (server.hasArg("ssid")) {
+        String s = server.arg("ssid");
+        String p = server.arg("pass");
+        s.toCharArray(wifiCfg.ssid, WIFI_SSID_MAX);
+        p.toCharArray(wifiCfg.pass, WIFI_PASS_MAX);
+        saveWiFiConfig();
+        server.send(200, "text/html", "<html><body><h3>Saved, restarting...</h3></body></html>");
+        delay(1000);
+        ESP.restart();
+        return;
+    }
+    server.send(400, "text/plain", "Missing fields");
+}
+
+void startAPPortal() {
+    String apName = "EyeConfig_" + String((uint32_t)ESP.getEfuseMac(), HEX).substring(8);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(apName.c_str());
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("Started AP: %s IP: %s\n", apName.c_str(), apIP.toString().c_str());
+    server.on("/", HTTP_GET, handlePortalRoot);
+    server.on("/save", HTTP_POST, handlePortalSave);
+    server.onNotFound(handlePortalRoot);
+    server.begin();
+}
+
+// =====================================================
+// Web / Serial control (original API)
+// =====================================================
+
+void sendCORS() { server.sendHeader("Access-Control-Allow-Origin", "*"); }
 
 String jsonStatus() {
     String s = "{";
@@ -181,16 +265,13 @@ String jsonStatus() {
     return s;
 }
 
-void handleStatus() {
-    sendCORS();
-    server.send(200, "application/json", jsonStatus());
-}
+void handleStatus() { sendCORS(); server.send(200, "application/json", jsonStatus()); }
 
 void handleSetEmotion() {
     sendCORS();
     if (server.hasArg("v")) {
         int v = server.arg("v").toInt();
-        if (v >= 0 && v <= 9) { emotion = v; server.send(200, "application/json", "{\"ok\":1}\" "); return; }
+        if (v >= 0 && v <= 9) { emotion = v; server.send(200, "application/json", "{\"ok\":1}"); return; }
     }
     server.send(400, "application/json", "{\"ok\":0,\"err\":\"invalid\"}");
 }
@@ -207,9 +288,7 @@ void handleSetIris() {
         else if (c == "gray") irisColor = IRIS_GRAY;
         else if (c == "red") irisColor = IRIS_RED;
         else { server.send(400, "application/json", "{\"ok\":0,\"err\":\"unknown color\"}"); return; }
-        // redraw base with new iris color
-        drawBaseEye();
-        drawPupil(pupilX, pupilY);
+        drawBaseEye(); drawPupil(pupilX, pupilY);
         server.send(200, "application/json", "{\"ok\":1}");
         return;
     }
@@ -222,17 +301,13 @@ void handleGaze() {
         int x = server.arg("x").toInt();
         int y = server.arg("y").toInt();
         movePupil(x, y);
-        server.send(200, "application/json", "{\"ok\":1}\" ");
+        server.send(200, "application/json", "{\"ok\":1}");
         return;
     }
     server.send(400, "application/json", "{\"ok\":0,\"err\":\"missing\"}");
 }
 
-void handleBlink() {
-    sendCORS();
-    blinkOnce(BLINK_SPEED_NORMAL);
-    server.send(200, "application/json", "{\"ok\":1}");
-}
+void handleBlink() { sendCORS(); blinkOnce(BLINK_SPEED_NORMAL); server.send(200, "application/json", "{\"ok\":1}"); }
 
 void handleControlPage() {
     sendCORS();
@@ -252,38 +327,19 @@ void handleControlPage() {
 
 void handleNotFound(){ sendCORS(); server.send(404, "text/plain", "Not found"); }
 
-// Serial parsing: simple commands
+// Serial parsing
+String serialBuf = "";
 void handleSerialLine(String line) {
-    line.trim();
-    if (line.length() == 0) return;
-    // split
+    line.trim(); if (line.length() == 0) return;
     int sp = line.indexOf(' ');
     String cmd = (sp < 0) ? line : line.substring(0, sp);
     String arg = (sp < 0) ? "" : line.substring(sp + 1);
     cmd.toLowerCase();
-    if (cmd == "blink") {
-        blinkOnce(BLINK_SPEED_NORMAL);
-    } else if (cmd == "gaze") {
-        // arg: x y
-        int sp2 = arg.indexOf(' ');
-        if (sp2 > 0) {
-            int x = arg.substring(0, sp2).toInt();
-            int y = arg.substring(sp2 + 1).toInt();
-            movePupil(x, y);
-        }
-    } else if (cmd == "iris") {
-        String c = arg;
-        c.toLowerCase();
-        if (c == "blue") irisColor = IRIS_BLUE;
-        else if (c == "green") irisColor = IRIS_GREEN;
-        else if (c == "brown") irisColor = IRIS_BROWN;
-        drawBaseEye(); drawPupil(pupilX, pupilY);
-    } else if (cmd == "pupil") {
-        int s = arg.toInt();
-        if (s >= MIN_PUPIL_SIZE && s <= MAX_PUPIL_SIZE) { pupilRadius = s; drawBaseEye(); drawPupil(pupilX, pupilY); }
-    } else if (cmd == "status") {
-        Serial.println(jsonStatus());
-    }
+    if (cmd == "blink") { blinkOnce(BLINK_SPEED_NORMAL); }
+    else if (cmd == "gaze") { int sp2 = arg.indexOf(' '); if (sp2 > 0) { int x = arg.substring(0, sp2).toInt(); int y = arg.substring(sp2 + 1).toInt(); movePupil(x, y); } }
+    else if (cmd == "iris") { String c = arg; c.toLowerCase(); if (c == "blue") irisColor = IRIS_BLUE; else if (c == "green") irisColor = IRIS_GREEN; else if (c == "brown") irisColor = IRIS_BROWN; drawBaseEye(); drawPupil(pupilX, pupilY); }
+    else if (cmd == "pupil") { int s = arg.toInt(); if (s >= MIN_PUPIL_SIZE && s <= MAX_PUPIL_SIZE) { pupilRadius = s; drawBaseEye(); drawPupil(pupilX, pupilY); } }
+    else if (cmd == "status") { Serial.println(jsonStatus()); }
 }
 
 String jsonStatus() {
